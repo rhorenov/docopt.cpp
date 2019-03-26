@@ -20,8 +20,59 @@
 #include <iostream>
 #include <cassert>
 #include <cstddef>
+#include <cctype>
 
 using namespace docopt;
+
+
+// Splitting and analyzing lines / indentation
+class Line
+{
+public:
+    typedef std::string::const_iterator iterator;
+
+    Line(const std::string &str) :
+        Line(str.begin(), str.end())
+    {}
+    Line(iterator begin, iterator end) :
+        _begin(begin),
+        _end(end)
+    {}
+
+    const iterator &begin() const { return _begin; }
+    const iterator &end()   const { return _end; }
+
+    iterator skip_indentation() const {
+        auto is_intendation = [](char c) { return c == ' ' || c == '\t'; };
+        return std::find_if_not(begin(), end(), is_intendation);
+    }
+
+    bool is_indented() const { return begin() != skip_indentation(); }
+    bool starts_with(const std::string &str) const {
+        auto start = skip_indentation();
+        return start == std::search(start, end(), str.begin(), str.end());
+    }
+    bool starts_with(char c) const {
+        auto start = skip_indentation();
+        return start != end() && *start == c;
+    }
+
+private:
+    iterator _begin;
+    iterator _end;
+};
+
+std::vector<Line> split_lines(std::string::const_iterator i, std::string::const_iterator end) {
+    std::vector<Line> lines;
+    while (i != end) {
+        auto line_end = std::find(i, end, '\n');
+        if (line_end != end) ++line_end; //Skip past the '\n'
+        lines.emplace_back(i, line_end);
+        i = line_end;
+    }
+    return lines;
+}
+std::vector<Line> split_lines(const std::string &str) { return split_lines(str.begin(), str.end()); }
 
 DOCOPT_INLINE
 std::ostream& docopt::operator<<(std::ostream& os, value const& val)
@@ -162,29 +213,29 @@ std::vector<T*> flat_filter(Pattern& pattern) {
 	return ret;
 }
 
-static std::vector<std::string> parse_section(std::string const& name, std::string const& source) {
-	// ECMAScript regex only has "?=" for a non-matching lookahead. In order to make sure we always have
-	// a newline to anchor our matching, we have to avoid matching the final newline of each grouping.
-	// Therefore, our regex is adjusted from the docopt Python one to use ?= to match the newlines before
-	// the following lines, rather than after.
-	std::regex const re_section_pattern {
-		"(?:^|\\n)"  // anchored at a linebreak (or start of string)
-		"("
-		   "[^\\n]*" + name + "[^\\n]*(?=\\n?)" // a line that contains the name
-		   "(?:\\n[ \\t].*?(?=\\n|$))*"         // followed by any number of lines that are indented
-		")",
-		std::regex::icase
-	};
+static std::vector<std::string> parse_section(std::string name, std::string const& source) {
+    // Split 'source' to sections.
+    // A section starts with 'name' followed by any number of lines that are indented.
 
-	std::vector<std::string> ret;
-	std::for_each(std::sregex_iterator(source.begin(), source.end(), re_section_pattern),
-		      std::sregex_iterator(),
-		      [&](std::smatch const& match)
-	{
-		ret.push_back(trim(match[1].str()));
-	});
+    static const auto tolower = [](char c) { return std::tolower(c); };
+    static const auto is_indented = [](const Line &l) { return l.is_indented(); };
 
-	return ret;
+    std::transform(name.begin(), name.end(), name.begin(), tolower); //Transform 'name' to lower case
+    auto is_header_line = [&](const Line &line) { //Perform a case-insensitive search for 'name'
+        static const auto matches_name = [&](char a, char b) { return tolower(a) == b; };
+        return line.end() != std::search(line.begin(), line.end(), name.begin(), name.end(), matches_name);
+    };
+
+    std::vector<std::string> sections;
+    auto lines = split_lines(source);
+    auto line = std::find_if(lines.begin(), lines.end(), is_header_line);
+    while (line != lines.end()) {
+        auto section_start = line;
+        line = std::find_if_not(line + 1, lines.end(), is_indented); //Find the section end
+        sections.push_back(trim({ section_start->begin(),(line - 1)->end() }));
+        line = std::find_if(line, lines.end(), is_header_line); //Find the next section
+    }
+    return sections;
 }
 
 static bool is_argument_spec(std::string const& token) {
@@ -523,26 +574,27 @@ static PatternList parse_argv(Tokens tokens, std::vector<Option>& options, bool 
 	return ret;
 }
 
-std::vector<Option> parse_defaults(std::string const& doc) {
-	// This pattern is a delimiter by which we split the options.
-	// The delimiter is a new line followed by a whitespace(s) followed by one or two hyphens.
-	static std::regex const re_delimiter{
-		"(?:^|\\n)[ \\t]*"  // a new line with leading whitespace
-		"(?=-{1,2})"        // [split happens here] (positive lookahead) ... and followed by one or two hyphes
-	};
+static std::vector<Option> parse_defaults(std::string const& doc) {
+    // For each options in each section delimited by 'options:' construct
+    // 'Option'.
 
-	std::vector<Option> defaults;
-	for (auto s : parse_section("options:", doc)) {
-		s.erase(s.begin(), s.begin() + static_cast<std::ptrdiff_t>(s.find(':')) + 1); // get rid of "options:"
+    static const auto is_option_line = [](const Line &l) { return l.starts_with('-'); };
 
-		for (const auto& opt : regex_split(s, re_delimiter)) {
-			if (starts_with(opt, "-")) {
-				defaults.emplace_back(Option::parse(opt));
-			}
-		}
-	}
+    std::vector<Option> options;
+    for (auto &section : parse_section("options:", doc)) {
+        //Get rid of "options:"
+        auto colon = std::find(section.begin(), section.end(), ':');
+        assert(colon != section.end());
 
-	return defaults;
+        auto lines = split_lines(colon + 1, section.end());
+        auto line = std::find_if(lines.begin(), lines.end(), is_option_line);
+        while (line != lines.end()) {
+            auto option_start = line;
+            line = std::find_if(line + 1, lines.end(), is_option_line);
+            options.push_back(Option::parse(trim({ option_start->skip_indentation(),(line - 1)->end() })));
+        }
+    }
+    return options;
 }
 
 static bool isOptionSet(PatternList const& options, std::string const& opt1, std::string const& opt2 = "") {
