@@ -703,7 +703,12 @@ docopt::docopt_parse(std::string const& doc,
 	}
 
 	if (matched) {
-		std::string leftover = join(argv.begin(), argv.end(), ", ");
+		std::vector<std::string> leftover_pattern_names;
+		std::transform(argv_patterns.begin(), argv_patterns.end(), std::back_inserter(leftover_pattern_names), [](auto p) {
+			return p->name();
+		});
+
+		std::string leftover = join(leftover_pattern_names.begin(), leftover_pattern_names.end(), ", ");
 		throw DocoptArgumentError("Unexpected argument: " + leftover);
 	}
 
